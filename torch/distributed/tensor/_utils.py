@@ -1,3 +1,4 @@
+from torch._dynamo.exc import unimplemented
 import threading
 from collections import defaultdict
 from collections.abc import Sequence
@@ -182,55 +183,76 @@ def _compute_local_shape_and_global_offset(
         # if rank not in the mesh, return empty offset
         return ((0,), ())
 
-    # StridedShard implies a non-standard order to apply shards; get the
-    # correct order to start applying splits
-    ordered_placements = _explicit_order_placements(mesh_shape, placements)
+    ordered_placements: Sequence[tuple[int, Placement]] = [(mesh_dim, p) for (mesh_dim, p) in enumerate(placements)]
+    # ordered_placements = _explicit_order_placements(mesh_shape, placements)
 
     local_shape = list(global_shape)
     # We'll compute the data for where the shard begins on a per-dim basis.
     # However, a single dim can be sharded multiple times, so we will end up
     # doing a Sum(size*stride) like computation to determine the location of our
     # shard for each of the shardings on that dim.
-    global_offset = [0] * len(global_shape)
+    global_offset: list[int | None] = [0] * len(global_shape)
+
+    shard_dim_to_global_offsets = {}
 
     for mesh_dim, placement in ordered_placements:
         mesh_dim_size = mesh_shape[mesh_dim]
-        if isinstance(placement, Shard):
+        if isinstance(placement, (Shard, _StridedShard)):
             shard_dim = placement.dim
+            zero_global_offset = global_shape[shard_dim]
             assert shard_dim < len(local_shape), (
                 f"Sharding dim {shard_dim} greater than tensor ndim {len(local_shape)}"
             )
-            shard_size, shard_offset = placement._local_shard_size_and_offset(
+            shard_size, shard_offsets = placement._local_shard_size_and_offset(
                 local_shape[shard_dim],
                 mesh_dim_size,
                 my_coordinate[mesh_dim],
             )
+            # if my_coordinate == [0, 1]:
+            #     import fbvscode
+            #     fbvscode.set_trace()
+            
+            if shard_dim not in shard_dim_to_global_offsets:
+                if shard_size > 0:
+                    shard_dim_to_global_offsets[shard_dim] = shard_offsets
+                else:
+                    shard_dim_to_global_offsets[shard_dim] = [zero_global_offset]
+            else:
+                global_shard_offsets = shard_dim_to_global_offsets[shard_dim]
+                if shard_size > 0:
+                    try:
+                        shard_dim_to_global_offsets[shard_dim] = [global_shard_offsets[i] for i in shard_offsets]
+                    except:
+                        import fbvscode
+                        fbvscode.set_trace()
+                else:
+                    shard_dim_to_global_offsets[shard_dim] = [zero_global_offset]
+
 
             local_shape[shard_dim] = shard_size
+            # shard_global_offset = global_offset[shard_dim] + not_none(shard_offset)
 
-            shard_global_offset = global_offset[shard_dim] + not_none(shard_offset)
+            # zero_global_offset = global_shape[shard_dim]
+            # if isinstance(shard_global_offset, torch.SymInt) and not isinstance(
+            #     zero_global_offset, torch.SymInt
+            # ):
+            #     zero_global_offset = torch.SymInt(zero_global_offset)
 
-            zero_global_offset = global_shape[shard_dim]
-            if isinstance(shard_global_offset, torch.SymInt) and not isinstance(
-                zero_global_offset, torch.SymInt
-            ):
-                zero_global_offset = torch.SymInt(zero_global_offset)
-
-            global_offset[shard_dim] = torch.sym_ite(
-                shard_size == 0,
-                # Special case to fill in a standardized non-garbage value for
-                # the global_offset of zero-sized shards.  This value is out
-                # of bounds of the tensor, so it won't conflict with any real
-                # offsets.  DCP may rely on this value to de-duplicate shards.
-                # Note that you can end up with zero-size shards that are
-                # still otherwise in bounds for the tensor (TODO: give an
-                # example).
-                zero_global_offset,
-                # As we successively shard the same dimension, we keep
-                # advancing our pointer beyond our original offset until we
-                # get to the final chunk start.
-                shard_global_offset,
-            )
+            # global_offset[shard_dim] = torch.sym_ite(
+            #     shard_size == 0,
+            #     # Special case to fill in a standardized non-garbage value for
+            #     # the global_offset of zero-sized shards.  This value is out
+            #     # of bounds of the tensor, so it won't conflict with any real
+            #     # offsets.  DCP may rely on this value to de-duplicate shards.
+            #     # Note that you can end up with zero-size shards that are
+            #     # still otherwise in bounds for the tensor (TODO: give an
+            #     # example).
+            #     zero_global_offset,
+            #     # As we successively shard the same dimension, we keep
+            #     # advancing our pointer beyond our original offset until we
+            #     # get to the final chunk start.
+            #     shard_global_offset,
+            # )
 
     # NOTE: the offset compute relies on the local shard index and it has no
     # problem when strided sharding is not present. To correctly compute, we assume
@@ -255,6 +277,10 @@ def _compute_local_shape_and_global_offset(
     # happen on mesh of 3 or more dimensions.
     # TODO: change this function to correctly address this.
     # TODO: this logic can be applied to contiguous sharding as well
+    for shard_dim, global_offsets in shard_dim_to_global_offsets.items():
+        # maybe do a contiuous check and throw error if not
+        global_offset[shard_dim] = global_offsets[0]
+
     return tuple(local_shape), tuple(global_offset)
 
 
